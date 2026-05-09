@@ -1,60 +1,18 @@
-<<<<<<< HEAD
-import os
-from supabase import create_client
-from dotenv import load_dotenv
-from datetime import datetime, timezone
-
-load_dotenv()
-supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-
-
-async def get_available_food(zip: str, income_tier: str) -> dict:
-    
-    # Determine which statuses this caller can see
-    if income_tier == "free":
-        allowed_statuses = ["food_bank_window", "open"]
-    else:
-        allowed_statuses = ["open"]
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Query listings
-    result = supabase.table("listings")\
-        .select("id, food_type, quantity, pickup_addr, pickup_time, expiry_time")\
-        .eq("zip", zip)\
-        .in_("status", allowed_statuses)\
-        .or_(f"expiry_time.gt.{now},expiry_time.is.null")\
-        .order("expiry_time", ascending=True)\
-        .limit(3)\
-        .execute()
-
-    listings = result.data
-
-    if not listings:
-        return {"result": "There's no food available near your area right now. Please check back soon."}
-
-    # Build voice-friendly response
-    lines = []
-    for item in listings:
-        pickup = item.get("pickup_time") or "time not specified"
-        addr = item.get("pickup_addr") or "address not specified"
-        lines.append(
-            f"{item['food_type']}, {item['quantity']}, pickup at {addr} by {pickup}"
-        )
-
-    summary = "Here's what's available near you: " + "; ".join(lines)
-    summary += ". Would you like to claim any of these?"
-
-    return {"result": summary}
-=======
 # services/tools.py
-from typing import TypedDict
+import re
+from typing import Literal, TypedDict
+
 from supabase import Client
 
+# Supabase table names — match schema.sql
+USERS_TABLE = "users"
+DONORS_TABLE = "donors"
+FOOD_BANKS_TABLE = "food_banks"
 
 
+# ============================================================
 # Federal Poverty Level + median-income lookup
-
+# ============================================================
 
 # 2026 HHS Poverty Guidelines (48 contiguous states + DC).
 # Verify against aspe.hhs.gov/poverty-guidelines before demo if precision matters.
@@ -85,10 +43,49 @@ ZIP_MEDIAN_INCOME = {
 DEFAULT_MEDIAN_INCOME = 75_000  # fallback when zip is unknown
 
 
+# ============================================================
+# Type definitions
+# ============================================================
+
 class TierResult(TypedDict):
-    tier: str        # "A" (highest priority), "B" (moderate), "C" (general)
+    tier: str        # internal priority band "A" | "B" | "C" (assistant-facing)
     label: str       # human-readable, for the assistant to speak
     fpl_ratio: float # diagnostic — median income / FPL threshold
+
+
+CallerRole = Literal["recipient", "donor", "food_bank", "unknown"]
+RegistrationStatus = Literal["unregistered", "pending", "registered", "rejected"]
+
+
+class IdentifyCallerResult(TypedDict, total=False):
+    role: CallerRole
+    registration_status: RegistrationStatus
+    user_id: str | None
+    donor_id: str | None
+    food_bank_id: str | None
+    income_tier: str | None  # users.income_tier: "free" | "discount"
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def normalize_phone(phone: str) -> str:
+    """
+    Canonical phone for DB lookups and upserts (US-first; extend as needed).
+    Always use this for identify + register so the same handset matches one row.
+    """
+    p = str(phone).strip()
+    digits = re.sub(r"\D", "", p)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if p.startswith("+") and len(digits) >= 10:
+        return f"+{digits}"
+    if digits:
+        return f"+{digits}"
+    return p
 
 
 def fpl_threshold(household_size: int) -> int:
@@ -115,7 +112,118 @@ def assign_income_tier(zip_code: str, household_size: int) -> TierResult:
     return {"tier": "C", "label": "general", "fpl_ratio": ratio}
 
 
-# Tool handler
+def _priority_band_to_income_tier(band: str) -> Literal["free", "discount"]:
+    """Maps internal A/B/C band to DB users.income_tier (schema: free | discount)."""
+    return "free" if band == "A" else "discount"
+
+
+# ============================================================
+# Tool: identify_caller
+# ============================================================
+
+async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
+    """
+    Tool: identify_caller(phone)
+
+    Fires first on every inbound call. Checks users, donors, and food_banks
+    tables in that order and returns role + registration status so the
+    assistant knows how to proceed.
+
+    Role resolution order:
+      1. users      → role: "recipient"
+      2. donors     → role: "donor"
+      3. food_banks → role: "food_bank"
+      4. no match   → role: "unknown", status: "unregistered"
+
+    Registration status mapping:
+      - recipient:  onboarded=True → "registered", onboarded=False → "pending"
+      - donor:      always "registered" (no status column on donors table)
+      - food_bank:  verified → "registered", rejected → "rejected", else → "pending"
+      - unknown:    "unregistered"
+    """
+    normalized = normalize_phone(phone)
+
+    # ── 1. Check users (recipients) ──────────────────────────
+    u = (
+        supabase.table(USERS_TABLE)
+        .select("id, onboarded, income_tier")
+        .eq("phone", normalized)
+        .maybe_single()
+        .execute()
+    )
+    if u.data:
+        row = u.data
+        reg: RegistrationStatus = (
+            "registered" if row.get("onboarded") else "pending"
+        )
+        return {
+            "role": "recipient",
+            "registration_status": reg,
+            "user_id": str(row["id"]),
+            "donor_id": None,
+            "food_bank_id": None,
+            "income_tier": row.get("income_tier"),
+        }
+
+    # ── 2. Check donors ──────────────────────────────────────
+    d = (
+        supabase.table(DONORS_TABLE)
+        .select("id")
+        .eq("phone", normalized)
+        .maybe_single()
+        .execute()
+    )
+    if d.data:
+        return {
+            "role": "donor",
+            "registration_status": "registered",
+            "user_id": None,
+            "donor_id": str(d.data["id"]),
+            "food_bank_id": None,
+            "income_tier": None,
+        }
+
+    # ── 3. Check food_banks ──────────────────────────────────
+    f = (
+        supabase.table(FOOD_BANKS_TABLE)
+        .select("id, status")
+        .eq("phone", normalized)
+        .maybe_single()
+        .execute()
+    )
+    if f.data:
+        row = f.data
+        st = str(row.get("status") or "").lower()
+        if st == "verified":
+            reg = "registered"
+        elif st == "rejected":
+            reg = "rejected"
+        else:
+            reg = "pending"
+        return {
+            "role": "food_bank",
+            "registration_status": reg,
+            "user_id": None,
+            "donor_id": None,
+            "food_bank_id": str(row["id"]),
+            "income_tier": None,
+        }
+
+    # ── 4. No match ──────────────────────────────────────────
+    return {
+        "role": "unknown",
+        "registration_status": "unregistered",
+        "user_id": None,
+        "donor_id": None,
+        "food_bank_id": None,
+        "income_tier": None,
+    }
+
+
+# ============================================================
+# Tool: register_new_user
+# ============================================================
+
 async def register_new_user(
     supabase: Client,
     phone: str,
@@ -126,38 +234,38 @@ async def register_new_user(
     """
     Tool: register_new_user(phone, zip, household_size)
 
-    Inserts a row into `users`, computes income tier via zip + household
-    size, and returns the tier so the assistant can use it on its next
-    turn (typically followed by get_available_food).
+    Fires after the assistant collects zip + household size from a new recipient.
+    Upserts a row in `users` with income_tier ∈ {free, discount} per schema.sql.
+    Response exposes priority band (A/B/C) for the assistant script.
 
-    Returns a dict that gets JSON-serialized into the Vapi webhook
-    response under {"results": [{"toolCallId": ..., "result": <this>}]}.
+    Income tier assignment:
+      - Uses area median income (by ZIP) vs. household FPL as a proxy.
+      - No personal income is collected.
+      - Band A (ratio < 1.3) → income_tier: "free"
+      - Band B/C (ratio ≥ 1.3) → income_tier: "discount"
     """
-    # Vapi sometimes sends numeric args as strings — coerce defensively.
     try:
         household_size = int(household_size)
     except (TypeError, ValueError):
         household_size = 1
 
-    # Accept "95616" or "95616-1234"; keep only the 5-digit prefix.
     zip_code = str(zip_code).strip().split("-")[0][:5]
-    phone = phone.strip()
+    phone = normalize_phone(phone)
 
     tier = assign_income_tier(zip_code, household_size)
+    income_tier = _priority_band_to_income_tier(tier["tier"])
 
     row = {
         "phone": phone,
         "zip": zip_code,
         "household_size": household_size,
-        "income_tier": tier["tier"],
+        "income_tier": income_tier,
         "lang": lang,
-        # `id`, `status`, `created_at` set by DB defaults
+        # onboarded defaults False in DB; set True via a later flow/tool
     }
 
-    # Upsert on phone — if the caller hangs up mid-onboarding and calls
-    # back, this updates rather than throwing on the unique constraint.
     result = (
-        supabase.table("users")
+        supabase.table(USERS_TABLE)
         .upsert(row, on_conflict="phone")
         .execute()
     )
@@ -168,9 +276,8 @@ async def register_new_user(
     return {
         "user_id": str(result.data[0]["id"]),
         "tier": tier["tier"],
+        "income_tier": income_tier,
         "label": tier["label"],
         "fpl_ratio": round(tier["fpl_ratio"], 2),
         "registered": True,
     }
-
->>>>>>> 0f0ba521a7b7c35d687ed81f903e269c88a077f1
