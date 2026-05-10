@@ -67,7 +67,7 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments.get("lang", "en"),
         )
 
-    if tool_name == "test_get-available-food":
+    if tool_name == "test_get_available_food":
         required = ["zip", "income_tier"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
