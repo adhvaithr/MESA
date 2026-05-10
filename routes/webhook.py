@@ -1,8 +1,9 @@
 # routes/webhook.py
 import os
+
 from fastapi import APIRouter
 from supabase import create_client
-from dotenv import load_dotenv
+
 from services.tools import (
     identify_caller,
     register_new_user,
@@ -12,8 +13,8 @@ from services.tools import (
     notify_food_banks,
     claim_food_listing,
     register_food_bank,
+    verify_organization,
 )
-load_dotenv()
 
 router = APIRouter()
 supabase = create_client(
@@ -62,5 +63,34 @@ async def test_claim_food_listing(listing_id: str, phone: str):
 
 
 @router.get("/test/register-food-bank")
-async def test_register_food_bank(phone: str, name: str, ein: str, address: str, zip_code: str, lang: str = "en"):
+async def test_register_food_bank(
+    phone: str,
+    name: str,
+    address: str,
+    zip_code: str,
+    ein: str | None = None,
+    lang: str = "en",
+):
     return await register_food_bank(supabase, phone, name, ein, address, zip_code, lang)
+
+
+@router.get("/test/verify-organization")
+async def test_verify_organization(
+    org_name: str,
+    address: str,
+    city: str,
+    state: str,
+    zipcode: str,
+    phone: str,
+    ein: str | None = None,
+):
+    return await verify_organization(
+        supabase=supabase,
+        org_name=org_name,
+        address=address,
+        city=city,
+        state=state,
+        zipcode=zipcode,
+        phone=phone,
+        ein=ein,
+    )

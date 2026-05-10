@@ -3,11 +3,17 @@ import asyncio
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Literal, TypedDict
 
 import httpx
 from supabase import Client
+
+try:
+    from firecrawl import Firecrawl
+except ImportError:  # pragma: no cover - runtime dependency in deployment.
+    Firecrawl = None  # type: ignore[assignment]
 
 # ============================================================
 # Table names — match schema.sql
@@ -65,6 +71,16 @@ class IdentifyCallerResult(TypedDict, total=False):
     income_tier: str | None
 
 
+class VerificationCheckResult(TypedDict):
+    passed: bool
+    reason: str
+    latency_ms: int
+
+
+CHECK_TIMEOUT_SECONDS = 1.2
+OVERALL_VERIFY_TIMEOUT_SECONDS = 2.5
+
+
 # ============================================================
 # Shared helpers
 # ============================================================
@@ -106,6 +122,612 @@ def assign_income_tier(zip_code: str, household_size: int) -> TierResult:
 
 def _priority_band_to_income_tier(band: str) -> Literal["free", "discount"]:
     return "free" if band == "A" else "discount"
+
+
+def normalize_ein(ein: str) -> str:
+    """Returns EIN in NN-NNNNNNN format when possible."""
+    digits = re.sub(r"\D", "", str(ein or ""))
+    if len(digits) != 9:
+        return str(ein or "").strip()
+    return f"{digits[:2]}-{digits[2:]}"
+
+
+def _ein_digits_if_valid(ein: str | None) -> str | None:
+    """Nine-digit EIN only, or None if missing/invalid."""
+    if ein is None:
+        return None
+    digits = re.sub(r"\D", "", str(ein).strip())
+    return digits if len(digits) == 9 else None
+
+
+def _ein_display_from_digits(digits: str) -> str:
+    return f"{digits[:2]}-{digits[2:]}"
+
+
+def _normalize_zip5(zipcode: str) -> str | None:
+    """US ZIP: first five digits, or None if not usable."""
+    z = re.sub(r"\D", "", str(zipcode or "").strip())
+    return z[:5] if len(z) >= 5 else None
+
+
+_US_STATE_NAMES: dict[str, str] = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "district of columbia": "DC",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+
+
+def _normalize_us_state_abbrev(state: str) -> str | None:
+    """Return two-letter USPS code, or None."""
+    raw = str(state or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 2 and raw.isalpha():
+        return raw.upper()
+    return _US_STATE_NAMES.get(raw.lower())
+
+
+def _normalize_name_for_match(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9 ]", " ", str(name or "").lower())
+    collapsed = re.sub(r"\s+", " ", cleaned).strip()
+    suffixes = {"inc", "llc", "corp", "co", "foundation", "the"}
+    tokens = [t for t in collapsed.split(" ") if t and t not in suffixes]
+    return " ".join(tokens)
+
+
+def _name_match_score(left: str, right: str) -> float:
+    l_tokens = set(_normalize_name_for_match(left).split())
+    r_tokens = set(_normalize_name_for_match(right).split())
+    if not l_tokens or not r_tokens:
+        return 0.0
+    overlap = l_tokens.intersection(r_tokens)
+    return len(overlap) / max(len(l_tokens), len(r_tokens))
+
+
+def _summary_from_checks(
+    org_name: str,
+    ein_match: bool,
+    address_valid: bool,
+    web_presence: bool,
+    failures: list[str],
+    ein_reason: str,
+    address_reason: str,
+    web_reason: str,
+) -> str:
+    reasons = (
+        f"ein={ein_reason}; "
+        f"address={address_reason}; "
+        f"web={web_reason}"
+    )
+    if ein_match and address_valid and web_presence:
+        return (
+            f"{org_name} verification passed: EIN, address, and web presence checks all succeeded. "
+            f"Evidence: {reasons}"
+        )
+    return f"{org_name} verification failed checks: {', '.join(failures)}. Evidence: {reasons}"
+
+
+async def _run_check_with_timeout(
+    check_name: str,
+    fn,
+    timeout_seconds: float,
+) -> VerificationCheckResult:
+    started = time.perf_counter()
+    try:
+        passed, reason = await asyncio.wait_for(fn(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        passed, reason = False, f"{check_name} timed out"
+    except Exception as exc:
+        passed, reason = False, f"{check_name} error: {exc}"
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    return {"passed": bool(passed), "reason": str(reason), "latency_ms": latency_ms}
+
+
+async def _check_ein_by_organization_id(
+    client: httpx.AsyncClient,
+    org_name: str,
+    ein_digits: str,
+    state_abbrev: str | None,
+    zip5: str | None,
+    *,
+    skip_zip_verification: bool = False,
+) -> tuple[bool, str]:
+    """Verify a known EIN against ProPublica org profile + caller name (and optional state/ZIP)."""
+    pp = await client.get(
+        f"https://projects.propublica.org/nonprofits/api/v2/organizations/{ein_digits}.json"
+    )
+    if pp.status_code == 404:
+        return False, "EIN not found in nonprofit registry"
+    if pp.status_code >= 400:
+        return False, f"EIN registry failed ({pp.status_code})"
+    payload = pp.json()
+    org = payload.get("organization") or {}
+    external_name = org.get("name") or ""
+    if not external_name:
+        return False, "EIN registry returned no organization"
+    if _name_match_score(org_name, external_name) < 0.5:
+        return False, f"EIN found but name mismatch ({external_name})"
+
+    if state_abbrev:
+        reg_state = str(org.get("state") or "").strip().upper()
+        if reg_state and reg_state != state_abbrev:
+            return False, f"EIN nonprofit is in {reg_state}, expected {state_abbrev}"
+
+    if not skip_zip_verification and zip5:
+        reg_zip_raw = org.get("zip") or org.get("ZIP") or org.get("zipcode") or ""
+        reg_zip = re.sub(r"\D", "", str(reg_zip_raw))[:5]
+        if len(reg_zip) == 5 and reg_zip != zip5:
+            return False, f"EIN nonprofit ZIP {reg_zip} does not match expected {zip5}"
+
+    return True, f"EIN {_ein_display_from_digits(ein_digits)} verified as {external_name}"
+
+
+async def _check_ein_by_propublica_name_search(
+    client: httpx.AsyncClient,
+    org_name: str,
+    _city: str,
+    state_abbrev: str | None,
+    zip5: str | None,
+) -> tuple[bool, str]:
+    """Resolve nonprofit by name when no EIN is available (ProPublica search: name only)."""
+    name_part = org_name.strip()
+    if not name_part:
+        return False, "No organization name for nonprofit lookup"
+
+    q = f'"{name_part}"' if len(name_part.split()) > 1 else name_part
+    search_params: dict[str, str | int] = {"q": q, "page": 0, "c_code[id]": 3}
+
+    response = await client.get(
+        "https://projects.propublica.org/nonprofits/api/v2/search.json",
+        params=search_params,
+    )
+    if response.status_code >= 400:
+        return False, f"Nonprofit name search failed ({response.status_code})"
+    data = response.json()
+    organizations = data.get("organizations") or []
+    if not organizations:
+        return False, "No nonprofit matches for organization name"
+
+    best: tuple[float, dict] | None = None
+    for row in organizations[:25]:
+        ext_name = str(row.get("name") or "")
+        if not ext_name:
+            continue
+        score = _name_match_score(org_name, ext_name)
+        if best is None or score > best[0]:
+            best = (score, row)
+
+    if best is None or best[0] < 0.42:
+        return False, "No confident nonprofit match by organization name"
+
+    ein_digits = str(best[1].get("ein") or "").replace("-", "")
+    digits_only = re.sub(r"\D", "", ein_digits)
+    if len(digits_only) != 9:
+        return False, "Search hit had no usable EIN"
+
+    ok, detail = await _check_ein_by_organization_id(
+        client,
+        org_name,
+        digits_only,
+        state_abbrev,
+        zip5,
+        skip_zip_verification=True,
+    )
+    if ok:
+        return True, f"Resolved by name: {detail}"
+    return False, f"Name search candidate failed verification ({detail})"
+
+
+async def _check_ein_external(
+    org_name: str,
+    city: str,
+    state_abbrev: str | None,
+    zip5: str | None,
+    ein: str | None,
+) -> tuple[bool, str]:
+    """
+    Prefer a concrete EIN (from DB or optional override). If none, resolve via
+    ProPublica search by organization name only. After a name-search hit, the
+    resolved EIN profile is still checked against state, but ZIP is not compared
+    on that path (IRS/ProPublica ZIP can differ from caller ZIP).
+    """
+    digits = _ein_digits_if_valid(ein)
+    async with httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS) as client:
+        if digits:
+            return await _check_ein_by_organization_id(client, org_name, digits, state_abbrev, zip5)
+        return await _check_ein_by_propublica_name_search(client, org_name, city, state_abbrev, zip5)
+
+
+async def _check_address_external(
+    address: str,
+    city: str,
+    state_abbrev: str | None,
+    zip5: str | None,
+) -> tuple[bool, str]:
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_GEOCODING_API_KEY")
+    if not api_key:
+        return False, "Missing GOOGLE_MAPS_API_KEY for geocode verification"
+
+    parts = [address.strip(), city.strip()]
+    if state_abbrev:
+        parts.append(state_abbrev)
+    if zip5:
+        parts.append(zip5)
+    query = ", ".join(p for p in parts if p)
+    async with httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS) as client:
+        response = await client.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": query, "key": api_key},
+        )
+        if response.status_code >= 400:
+            return False, f"Geocode failed ({response.status_code})"
+        payload = response.json()
+        if payload.get("status") != "OK":
+            return False, f"Geocode status {payload.get('status')}"
+        results = payload.get("results") or []
+        if not results:
+            return False, "Geocode returned no matches"
+
+        top = results[0]
+        formatted = str(top.get("formatted_address") or "").lower()
+        city_norm = city.strip().lower()
+        components = top.get("address_components") or []
+        component_text = " ".join(
+            " ".join(comp.get("types", [])) + " " + comp.get("long_name", "")
+            for comp in components
+        ).lower()
+        has_city_match = city_norm and (city_norm in formatted or city_norm in component_text)
+        if not has_city_match:
+            return False, "Geocode resolved but city did not match"
+
+        if state_abbrev:
+            state_short = None
+            for comp in components:
+                types = comp.get("types") or []
+                if "administrative_area_level_1" in types:
+                    state_short = str(comp.get("short_name") or "").strip().upper()
+                    break
+            if state_short and state_short != state_abbrev:
+                return False, f"Geocode state is {state_short}, expected {state_abbrev}"
+
+        if zip5:
+            postal = None
+            for comp in components:
+                types = comp.get("types") or []
+                if "postal_code" in types:
+                    postal = re.sub(r"\D", "", str(comp.get("long_name") or comp.get("short_name") or ""))[:5]
+                    break
+            if postal and len(postal) == 5 and postal != zip5:
+                return False, f"Geocode ZIP {postal} does not match expected {zip5}"
+
+        return True, "Address validated by geocode"
+
+
+async def _check_web_presence_external(
+    org_name: str,
+    city: str,
+    state_abbrev: str | None,
+    zip5: str | None,
+) -> tuple[bool, str]:
+    loc_parts = [org_name, city]
+    if state_abbrev:
+        loc_parts.append(state_abbrev)
+    if zip5:
+        loc_parts.append(zip5)
+    query = " ".join(p for p in loc_parts if p).strip() + " food bank"
+    firecrawl_api_key = os.getenv("FIRECRAWL_API_KEY")
+
+    if not firecrawl_api_key:
+        return False, "Missing FIRECRAWL_API_KEY for web presence verification"
+    if Firecrawl is None:
+        return False, "Missing firecrawl-py dependency. Install with: pip install firecrawl-py"
+
+    firecrawl = Firecrawl(api_key=firecrawl_api_key)
+    try:
+        data = await asyncio.to_thread(lambda: firecrawl.search(query=query, limit=5))
+    except TypeError:
+        data = await asyncio.to_thread(lambda: firecrawl.search(query, limit=5))
+
+    results = []
+    if isinstance(data, dict):
+        results = data.get("web") or data.get("data") or data.get("results") or []
+    else:
+        results = getattr(data, "web", None) or getattr(data, "data", None) or []
+
+    if not results:
+        return False, "No web results from Firecrawl"
+
+    name_match_min = 0.25
+    best_name_score = 0.0
+    evidence: list[str] = []
+
+    for raw in results[:5]:
+        if isinstance(raw, dict):
+            title = str(raw.get("title") or "")
+            snippet = str(raw.get("description") or raw.get("snippet") or raw.get("markdown") or "")
+            url = str(raw.get("url") or raw.get("source") or "")
+        else:
+            title = str(getattr(raw, "title", "") or "")
+            snippet = str(
+                getattr(raw, "description", "")
+                or getattr(raw, "snippet", "")
+                or getattr(raw, "markdown", "")
+                or ""
+            )
+            url = str(getattr(raw, "url", "") or getattr(raw, "source", "") or "")
+
+        combined = f"{title} {snippet} {url}".lower()
+        name_score = _name_match_score(org_name, combined)
+        best_name_score = max(best_name_score, name_score)
+
+        if len(evidence) < 2 and name_score >= name_match_min:
+            short_title = title[:90] if title else url[:90]
+            evidence.append(short_title)
+
+    evidence_text = ", ".join(evidence) if evidence else "no snippets"
+    if best_name_score >= name_match_min:
+        return (
+            True,
+            f"Web listings include the organization name (token_overlap={best_name_score:.2f}); evidence={evidence_text}",
+        )
+    return (
+        False,
+        f"No listing contains a usable match for the organization name (best_token_overlap={best_name_score:.2f}); "
+        f"snippets={evidence_text}",
+    )
+
+
+async def verify_organization(
+    supabase: Client,
+    org_name: str,
+    address: str,
+    city: str,
+    state: str,
+    zipcode: str,
+    phone: str,
+    ein: str | None = None,
+) -> dict:
+    """
+    Runs EIN + geocode + web checks in parallel and writes to verification_queue.
+    Also updates food_banks.status immediately for voice-agent flows.
+
+    ``org_name`` is required (as collected from the caller). It is used for EIN
+    and web checks, not replaced by the name on file.
+
+    ``state`` and ``zipcode`` disambiguate same-named cities (e.g. Fremont, CA vs NE).
+
+    EIN is optional: use the value stored on ``food_banks`` for this phone, or
+    an optional override. If no valid EIN is available, ProPublica name search
+    uses ``org_name``, city, state, and ZIP to resolve a nonprofit.
+    """
+    normalized_phone = normalize_phone(phone)
+    org_name_clean = str(org_name).strip()
+    if not org_name_clean:
+        return {
+            "all_passed": False,
+            "failed_checks": ["organization_name"],
+            "summary": "Organization name is required for verification.",
+        }
+
+    address = str(address).strip()
+    city = str(city).strip()
+
+    state_abbrev = _normalize_us_state_abbrev(state)
+    if not state_abbrev:
+        return {
+            "all_passed": False,
+            "failed_checks": ["state"],
+            "summary": "Valid U.S. state is required (two-letter code, e.g. CA, or full name).",
+        }
+
+    zip5 = _normalize_zip5(zipcode)
+    if not zip5:
+        return {
+            "all_passed": False,
+            "failed_checks": ["zipcode"],
+            "summary": "Valid 5-digit U.S. ZIP code is required.",
+        }
+
+    food_bank_lookup = await asyncio.to_thread(
+        lambda: (
+            supabase.table(FOOD_BANKS_TABLE)
+            .select("id, zip, ein")
+            .eq("phone", normalized_phone)
+            .maybe_single()
+            .execute()
+        )
+    )
+    row = getattr(food_bank_lookup, "data", None) if food_bank_lookup is not None else None
+    if not row:
+        return {
+            "all_passed": False,
+            "failed_checks": ["food_bank_registration"],
+            "summary": "Food bank must be registered before verification.",
+        }
+
+    food_bank_id = str(row["id"])
+
+    db_zip = _normalize_zip5(str(row.get("zip") or ""))
+    if db_zip and db_zip != zip5:
+        return {
+            "all_passed": False,
+            "failed_checks": ["zipcode_mismatch"],
+            "summary": "ZIP code does not match the food bank registration on file.",
+        }
+
+    param_digits = _ein_digits_if_valid(ein)
+    db_digits = _ein_digits_if_valid(row.get("ein"))
+    ein_digits_for_check = param_digits or db_digits
+    ein_for_check: str | None = _ein_display_from_digits(ein_digits_for_check) if ein_digits_for_check else None
+    ein_resolution = (
+        "parameter" if param_digits else ("database" if db_digits else "name_lookup")
+    )
+
+    try:
+        checks = await asyncio.wait_for(
+            asyncio.gather(
+                _run_check_with_timeout(
+                    "ein_match",
+                    lambda n=org_name_clean, c=city, s=state_abbrev, z=zip5, e=ein_for_check: _check_ein_external(
+                        n, c, s, z, e
+                    ),
+                    CHECK_TIMEOUT_SECONDS,
+                ),
+                _run_check_with_timeout(
+                    "address_valid",
+                    lambda: _check_address_external(
+                        address=address,
+                        city=city,
+                        state_abbrev=state_abbrev,
+                        zip5=zip5,
+                    ),
+                    CHECK_TIMEOUT_SECONDS,
+                ),
+                _run_check_with_timeout(
+                    "web_presence",
+                    lambda: _check_web_presence_external(
+                        org_name=org_name_clean,
+                        city=city,
+                        state_abbrev=state_abbrev,
+                        zip5=zip5,
+                    ),
+                    CHECK_TIMEOUT_SECONDS,
+                ),
+            ),
+            timeout=OVERALL_VERIFY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        checks = [
+            {"passed": False, "reason": "ein_match timed out by global budget", "latency_ms": int(OVERALL_VERIFY_TIMEOUT_SECONDS * 1000)},
+            {"passed": False, "reason": "address_valid timed out by global budget", "latency_ms": int(OVERALL_VERIFY_TIMEOUT_SECONDS * 1000)},
+            {"passed": False, "reason": "web_presence timed out by global budget", "latency_ms": int(OVERALL_VERIFY_TIMEOUT_SECONDS * 1000)},
+        ]
+
+    ein_result, address_result, web_result = checks
+    ein_match = ein_result["passed"]
+    address_valid = address_result["passed"]
+    web_presence = web_result["passed"]
+    failed_checks: list[str] = []
+    if not ein_match:
+        failed_checks.append("ein_match")
+    if not address_valid:
+        failed_checks.append("address_valid")
+    if not web_presence:
+        failed_checks.append("web_presence")
+
+    all_passed = not failed_checks
+    summary = _summary_from_checks(
+        org_name=org_name_clean,
+        ein_match=ein_match,
+        address_valid=address_valid,
+        web_presence=web_presence,
+        failures=failed_checks,
+        ein_reason=ein_result["reason"],
+        address_reason=address_result["reason"],
+        web_reason=web_result["reason"],
+    )
+    review_token = secrets.token_urlsafe(24)
+
+    verification_write = await asyncio.to_thread(
+        lambda: (
+            supabase.table(VERIFICATION_QUEUE_TABLE)
+            .insert(
+                {
+                    "food_bank_id": food_bank_id,
+                    "ein_match": ein_match,
+                    "address_valid": address_valid,
+                    "web_presence": web_presence,
+                    "summary": summary,
+                    "review_token": review_token,
+                }
+            )
+            .execute()
+        )
+    )
+    verification_id = None
+    if verification_write is not None:
+        vdata = getattr(verification_write, "data", None)
+        if vdata and isinstance(vdata, list) and len(vdata) > 0:
+            verification_id = str(vdata[0]["id"])
+
+    fb_update_payload: dict[str, str | None] = {
+        "status": "verified" if all_passed else "rejected",
+        "verified_at": datetime.now(timezone.utc).isoformat() if all_passed else None,
+    }
+    await asyncio.to_thread(
+        lambda: (
+            supabase.table(FOOD_BANKS_TABLE)
+            .update(fb_update_payload)
+            .eq("id", food_bank_id)
+            .execute()
+        )
+    )
+
+    return {
+        "food_bank_id": food_bank_id,
+        "verification_id": verification_id,
+        "all_passed": all_passed,
+        "failed_checks": failed_checks,
+        "summary": summary,
+        "organization_name_used": org_name_clean,
+        "state": state_abbrev,
+        "zipcode": zip5,
+        "ein_resolution": ein_resolution,
+        "ein_used": ein_for_check,
+        "check_details": {
+            "ein_match": ein_result,
+            "address_valid": address_result,
+            "web_presence": web_result,
+        },
+    }
 
 
 # ============================================================
@@ -572,7 +1194,7 @@ async def register_food_bank(
     supabase: Client,
     phone: str,
     name: str,
-    ein: str,
+    ein: str | None,
     address: str,
     zip_code: str,
     lang: str = "en",
@@ -581,28 +1203,53 @@ async def register_food_bank(
     Fires after assistant collects contact info from a food bank caller,
     before verify_organization runs. Inserts food_bank row with status pending.
     """
-    result = (
-        supabase.table(FOOD_BANKS_TABLE)
-        .upsert({
-            "phone": normalize_phone(phone),
-            "name": str(name).strip(),
-            "ein": str(ein).strip(),
-            "address": str(address).strip(),
-            "zip": str(zip_code).strip().split("-")[0][:5],
-            "preferred_lang": str(lang).strip() or "en",
-            "status": "pending",
-        }, on_conflict="phone")
-        .execute()
+    phone_n = normalize_phone(phone)
+    param_digits = _ein_digits_if_valid(ein)
+    ein_value: str | None = _ein_display_from_digits(param_digits) if param_digits else None
+
+    existing = await asyncio.to_thread(
+        lambda: (
+            supabase.table(FOOD_BANKS_TABLE)
+            .select("ein")
+            .eq("phone", phone_n)
+            .maybe_single()
+            .execute()
+        )
+    )
+    existing_row = getattr(existing, "data", None) if existing is not None else None
+    if ein_value is None and existing_row and existing_row.get("ein"):
+        prev = _ein_digits_if_valid(str(existing_row["ein"]))
+        if prev:
+            ein_value = _ein_display_from_digits(prev)
+
+    result = await asyncio.to_thread(
+        lambda: (
+            supabase.table(FOOD_BANKS_TABLE)
+            .upsert(
+                {
+                    "phone": phone_n,
+                    "name": str(name).strip(),
+                    "ein": ein_value,
+                    "address": str(address).strip(),
+                    "zip": str(zip_code).strip().split("-")[0][:5],
+                    "preferred_lang": str(lang).strip() or "en",
+                    "status": "pending",
+                },
+                on_conflict="phone",
+            )
+            .execute()
+        )
     )
 
-    if not result.data:
+    row_data = getattr(result, "data", None) if result is not None else None
+    if not row_data:
         raise RuntimeError(f"food_banks upsert returned no row: {result}")
 
-    food_bank = result.data[0]
+    food_bank = row_data[0]
     return {
         "food_bank_id": str(food_bank["id"]),
         "name": name,
-        "ein": ein,
+        "ein": ein_value,
         "address": address,
         "zip": zip_code,
         "lang": lang,
