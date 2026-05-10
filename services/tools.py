@@ -126,7 +126,7 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         .maybe_single()
         .execute()
     )
-    if u.data:
+    if u and u.data:
         row = u.data
         reg: RegistrationStatus = "registered" if row.get("onboarded") else "pending"
         return {
@@ -145,7 +145,7 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         .maybe_single()
         .execute()
     )
-    if d.data:
+    if d and d.data:
         return {
             "role": "donor",
             "registration_status": "registered",
@@ -162,7 +162,7 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         .maybe_single()
         .execute()
     )
-    if f.data:
+    if f and f.data:
         row = f.data
         st = str(row.get("status") or "").lower()
         reg = "registered" if st == "verified" else ("rejected" if st == "rejected" else "pending")

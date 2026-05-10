@@ -2,7 +2,7 @@
 import os
 from fastapi import APIRouter
 from supabase import create_client
-
+from dotenv import load_dotenv
 from services.tools import (
     identify_caller,
     register_new_user,
@@ -13,6 +13,7 @@ from services.tools import (
     claim_food_listing,
     register_food_bank,
 )
+load_dotenv()
 
 router = APIRouter()
 supabase = create_client(
