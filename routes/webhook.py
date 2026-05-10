@@ -3,6 +3,17 @@ import os
 
 from fastapi import APIRouter
 from supabase import create_client
+from services.tools import (
+    identify_caller,
+    register_new_user,
+    register_donor,
+    get_available_food,
+    save_food_listing,
+    notify_food_banks,
+    claim_food_listing,
+    register_food_bank,
+    get_nearby_food_banks,
+)
 
 from services.tools import (
     identify_caller,
@@ -94,3 +105,6 @@ async def test_verify_organization(
         phone=phone,
         ein=ein,
     )
+@router.get("/test/get-nearby-food-banks")
+async def test_get_nearby_food_banks(zip: str):
+    return await get_nearby_food_banks(supabase, zip)
