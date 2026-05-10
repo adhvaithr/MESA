@@ -1,5 +1,6 @@
 # routes/webhook.py
 import json
+import logging
 import os
 
 from fastapi import APIRouter, Request
@@ -19,6 +20,7 @@ from services.tools import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 supabase = create_client(
     os.getenv("SUPABASE_URL"),   # set in your .env
     os.getenv("SUPABASE_KEY"),   # set in your .env
@@ -144,23 +146,38 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
 async def vapi_webhook(request: Request):
     try:
         body = await request.json()
-    except Exception:
+    except Exception as exc:
+        logger.exception("VAPI webhook: failed to parse JSON body: %s", exc)
         return {"results": []}
 
     if not isinstance(body, dict):
+        logger.warning("VAPI webhook: ignored non-dict body: %s", type(body).__name__)
         return {"results": []}
+
+    logger.info("VAPI webhook: incoming payload=%s", json.dumps(body, default=str))
 
     message = body.get("message", {})
     if not isinstance(message, dict) or message.get("type") != "tool-calls":
+        logger.warning(
+            "VAPI webhook: ignored message type. message=%s",
+            json.dumps(message, default=str),
+        )
         return {"results": []}
 
     tool_call_list = message.get("toolCallList", [])
     if not isinstance(tool_call_list, list):
+        logger.warning(
+            "VAPI webhook: toolCallList is not a list. value=%s",
+            json.dumps(tool_call_list, default=str),
+        )
         return {"results": []}
+
+    logger.info("VAPI webhook: received %d tool call(s)", len(tool_call_list))
 
     results = []
     for tool_call in tool_call_list:
         if not isinstance(tool_call, dict):
+            logger.warning("VAPI webhook: skipped non-dict tool call: %s", type(tool_call).__name__)
             continue
 
         call_id = str(tool_call.get("id", ""))
@@ -175,15 +192,35 @@ async def vapi_webhook(request: Request):
         if not isinstance(arguments, dict):
             arguments = {}
 
+        logger.info(
+            "VAPI webhook: dispatching call_id=%s tool_name=%s arguments=%s",
+            call_id,
+            tool_name,
+            json.dumps(arguments, default=str),
+        )
+
         try:
             result = await _dispatch_tool_call(tool_name, arguments)
         except Exception as exc:
+            logger.exception(
+                "VAPI webhook: tool execution failed call_id=%s tool_name=%s error=%s",
+                call_id,
+                tool_name,
+                exc,
+            )
             result = {
                 "ok": False,
                 "error": "tool_execution_failed",
                 "tool": tool_name,
                 "message": str(exc),
             }
+        else:
+            logger.info(
+                "VAPI webhook: tool completed call_id=%s tool_name=%s result=%s",
+                call_id,
+                tool_name,
+                json.dumps(result, default=str),
+            )
 
         results.append(
             {
@@ -192,6 +229,7 @@ async def vapi_webhook(request: Request):
             }
         )
 
+    logger.info("VAPI webhook: returning results=%s", json.dumps(results, default=str))
     return {"results": results}
 
 
