@@ -1823,19 +1823,7 @@ async def request_food_from_food_bank(
     )
     if not claim_lookup or not claim_lookup.data:
         return {"success": False, "reason": "food_bank_claim_not_found"}
-
-    request_insert = (
-        supabase.table(CLAIMS_TABLE)
-        .insert(
-            {
-                "listing_id": listing_id,
-                "claimer_phone": recipient_phone_n,
-                "claimer_type": "user",
-            }
-        )
-        .execute()
-    )
-    request_row = request_insert.data[0] if request_insert and request_insert.data else None
+    linked_claim = claim_lookup.data[0]
 
     asyncio.create_task(
         _notify_food_bank_of_recipient_interest(
@@ -1853,7 +1841,8 @@ async def request_food_from_food_bank(
     )
     return {
         "success": True,
-        "request_id": str(request_row["id"]) if request_row else None,
+        "request_id": None,
+        "linked_food_bank_claim_id": str(linked_claim.get("id") or ""),
         "listing_id": listing_id,
         "food_bank_phone": food_bank_phone_n,
         "food_bank_name": food_bank_row.get("name"),
