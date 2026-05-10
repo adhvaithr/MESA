@@ -1170,6 +1170,19 @@ async def _lookup_claimer(supabase: Client, phone: str) -> dict[str, str]:
     return {"role": "unknown"}
 
 
+def _to_claims_claimer_type(role: str) -> str:
+    """
+    Map app-level roles to claims.claimer_type allowed values.
+    DB constraint rejects 'recipient'; use 'user' for recipients.
+    """
+    role_norm = str(role or "").strip().lower()
+    if role_norm == "recipient":
+        return "user"
+    if role_norm in {"food_bank", "donor", "user"}:
+        return role_norm
+    return "user"
+
+
 async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, str]) -> None:
     """Fire-and-forget donor notification via Vapi outbound call."""
     vapi_key = os.getenv("VAPI_API_KEY")
@@ -1280,7 +1293,7 @@ async def claim_food_listing_by_id(
             {
                 "listing_id": listing["id"],
                 "claimer_phone": phone,
-                "claimer_type": claimer["role"],
+                "claimer_type": _to_claims_claimer_type(claimer["role"]),
             }
         )
         .execute()
@@ -1400,7 +1413,7 @@ async def claim_food_listing(
         .insert({
             "listing_id": listing["id"],
             "claimer_phone": phone,
-            "claimer_type": claimer["role"],
+            "claimer_type": _to_claims_claimer_type(claimer["role"]),
         })
         .execute()
     )
@@ -1817,7 +1830,7 @@ async def request_food_from_food_bank(
             {
                 "listing_id": listing_id,
                 "claimer_phone": recipient_phone_n,
-                "claimer_type": "recipient",
+                "claimer_type": "user",
             }
         )
         .execute()
