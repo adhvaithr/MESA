@@ -1,7 +1,8 @@
 # routes/webhook.py
+import json
 import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from supabase import create_client
 from services.tools import (
@@ -22,6 +23,176 @@ supabase = create_client(
     os.getenv("SUPABASE_URL"),   # set in your .env
     os.getenv("SUPABASE_KEY"),   # set in your .env
 )
+
+
+def _missing_args(tool_name: str, arguments: dict, required: list[str]) -> dict:
+    missing = [key for key in required if key not in arguments]
+    return {
+        "ok": False,
+        "error": "missing_arguments",
+        "tool": tool_name,
+        "required": required,
+        "missing": missing,
+    }
+
+
+async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
+    if tool_name == "identify-caller":
+        if "phone" not in arguments:
+            return _missing_args(tool_name, arguments, ["phone"])
+        return await identify_caller(supabase, arguments["phone"])
+
+    if tool_name == "register-new-user":
+        required = ["phone", "zip_code", "household_size"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await register_new_user(
+            supabase,
+            arguments["phone"],
+            arguments["zip_code"],
+            arguments["household_size"],
+            arguments.get("lang", "en"),
+        )
+
+    if tool_name == "register-donor":
+        required = ["phone", "name", "business", "zip"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await register_donor(
+            supabase,
+            arguments["phone"],
+            arguments["name"],
+            arguments["business"],
+            arguments["zip"],
+            arguments.get("lang", "en"),
+        )
+
+    if tool_name == "get-available-food":
+        required = ["zip", "income_tier"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await get_available_food(supabase, arguments["zip"], arguments["income_tier"])
+
+    if tool_name == "save-food-listing":
+        required = ["food_type", "quantity", "pickup_time", "zip_code", "donor_phone"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await save_food_listing(
+            supabase,
+            arguments["food_type"],
+            arguments["quantity"],
+            arguments["pickup_time"],
+            arguments["zip_code"],
+            arguments["donor_phone"],
+        )
+
+    if tool_name == "notify-food-banks":
+        required = ["listing_id", "zip"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await notify_food_banks(supabase, arguments["listing_id"], arguments["zip"])
+
+    if tool_name == "claim-food-listing":
+        required = ["food_type", "pickup_hint", "phone"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await claim_food_listing(
+            supabase,
+            arguments["food_type"],
+            arguments["pickup_hint"],
+            arguments["phone"],
+        )
+
+    if tool_name == "register-food-bank":
+        required = ["phone", "name", "address", "zip_code"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await register_food_bank(
+            supabase,
+            arguments["phone"],
+            arguments["name"],
+            arguments.get("ein"),
+            arguments["address"],
+            arguments["zip_code"],
+            arguments.get("lang", "en"),
+        )
+
+    if tool_name == "verify-organization":
+        required = ["org_name", "address", "city", "state", "zipcode", "phone"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await verify_organization(
+            supabase=supabase,
+            org_name=arguments["org_name"],
+            address=arguments["address"],
+            city=arguments["city"],
+            state=arguments["state"],
+            zipcode=arguments["zipcode"],
+            phone=arguments["phone"],
+            ein=arguments.get("ein"),
+        )
+
+    if tool_name == "get-nearby-food-banks":
+        if "zip" not in arguments:
+            return _missing_args(tool_name, arguments, ["zip"])
+        return await get_nearby_food_banks(supabase, arguments["zip"])
+
+    return {"ok": False, "error": f"Unknown tool: {tool_name}"}
+
+
+@router.post("/vapi/webhook")
+async def vapi_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"results": []}
+
+    if not isinstance(body, dict):
+        return {"results": []}
+
+    message = body.get("message", {})
+    if not isinstance(message, dict) or message.get("type") != "tool-calls":
+        return {"results": []}
+
+    tool_call_list = message.get("toolCallList", [])
+    if not isinstance(tool_call_list, list):
+        return {"results": []}
+
+    results = []
+    for tool_call in tool_call_list:
+        if not isinstance(tool_call, dict):
+            continue
+
+        call_id = str(tool_call.get("id", ""))
+        tool_name = str(tool_call.get("name", ""))
+        arguments = tool_call.get("arguments", {})
+
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        try:
+            result = await _dispatch_tool_call(tool_name, arguments)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "error": "tool_execution_failed",
+                "tool": tool_name,
+                "message": str(exc),
+            }
+
+        results.append(
+            {
+                "toolCallId": call_id,
+                "result": json.dumps(result, default=str),
+            }
+        )
+
+    return {"results": results}
 
 
 class IdentifyCallerRequest(BaseModel):
