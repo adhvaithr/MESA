@@ -37,12 +37,12 @@ def _missing_args(tool_name: str, arguments: dict, required: list[str]) -> dict:
 
 
 async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
-    if tool_name == "identify-caller":
+    if tool_name == "test_identify_caller":
         if "phone" not in arguments:
             return _missing_args(tool_name, arguments, ["phone"])
         return await identify_caller(supabase, arguments["phone"])
 
-    if tool_name == "register-new-user":
+    if tool_name == "test_register_new_user":
         required = ["phone", "zip_code", "household_size"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -54,7 +54,7 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments.get("lang", "en"),
         )
 
-    if tool_name == "register-donor":
+    if tool_name == "test_register_donor":
         required = ["phone", "name", "business", "zip"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -67,13 +67,13 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments.get("lang", "en"),
         )
 
-    if tool_name == "get-available-food":
+    if tool_name == "test_get-available-food":
         required = ["zip", "income_tier"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
         return await get_available_food(supabase, arguments["zip"], arguments["income_tier"])
 
-    if tool_name == "save-food-listing":
+    if tool_name == "test_save_food_listing":
         required = ["food_type", "quantity", "pickup_time", "zip_code", "donor_phone"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -86,13 +86,13 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments["donor_phone"],
         )
 
-    if tool_name == "notify-food-banks":
+    if tool_name == "test_notify_food_banks":
         required = ["listing_id", "zip"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
         return await notify_food_banks(supabase, arguments["listing_id"], arguments["zip"])
 
-    if tool_name == "claim-food-listing":
+    if tool_name == "test_claim_food_listing":
         required = ["food_type", "pickup_hint", "phone"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -103,7 +103,7 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments["phone"],
         )
 
-    if tool_name == "register-food-bank":
+    if tool_name == "test_register_food_bank":
         required = ["phone", "name", "address", "zip_code"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -117,7 +117,7 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments.get("lang", "en"),
         )
 
-    if tool_name == "verify-organization":
+    if tool_name == "test_verify_organization":
         required = ["org_name", "address", "city", "state", "zipcode", "phone"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
@@ -132,7 +132,7 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             ein=arguments.get("ein"),
         )
 
-    if tool_name == "get-nearby-food-banks":
+    if tool_name == "test_get_nearby_food_banks":
         if "zip" not in arguments:
             return _missing_args(tool_name, arguments, ["zip"])
         return await get_nearby_food_banks(supabase, arguments["zip"])
