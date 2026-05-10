@@ -272,7 +272,8 @@ class NotifyFoodBanksRequest(BaseModel):
 
 
 class ClaimFoodListingRequest(BaseModel):
-    listing_id: str
+    food_type: str
+    pickup_hint: str
     phone: str
 
 
