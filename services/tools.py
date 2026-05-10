@@ -1062,8 +1062,8 @@ async def notify_food_banks(supabase: Client, listing_id: str, zip: str) -> dict
             lambda: vapi.calls.create(
                 assistant_id=assistant_id,
                 assistant_overrides={
-                    "systemPrompt": prompt,
-                    "variableValues": {"listing_id": listing_id},
+                    "first_message": prompt,
+                    "variable_values": {"listing_id": listing_id},
                 },
                 phone_number_id=phone_number_id,
                 customer={"number": bank["phone"]},
@@ -1203,8 +1203,8 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
             lambda: vapi.calls.create(
                 assistant_id=assistant_id,
                 assistant_overrides={
-                    "systemPrompt": prompt,
-                    "variableValues": {"listing_id": str(listing.get("id"))},
+                    "first_message": prompt,
+                    "variable_values": {"listing_id": str(listing.get("id"))},
                 },
                 phone_number_id=phone_number_id,
                 customer={"number": donor_phone},
