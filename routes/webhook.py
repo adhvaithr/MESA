@@ -181,8 +181,9 @@ async def vapi_webhook(request: Request):
             continue
 
         call_id = str(tool_call.get("id", ""))
-        tool_name = str(tool_call.get("name", ""))
-        arguments = tool_call.get("arguments", {})
+        func = tool_call.get("function", {})
+        tool_name = str(func.get("name", ""))
+        arguments = func.get("arguments", {})
 
         if isinstance(arguments, str):
             try:
