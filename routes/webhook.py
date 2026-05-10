@@ -15,6 +15,7 @@ from services.tools import (
     notify_food_banks,
     claim_food_listing,
     claim_food_listing_by_id,
+    request_food_from_food_bank,
     register_food_bank,
     verify_organization,
     get_nearby_food_banks,
@@ -110,6 +111,17 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
             arguments["food_type"],
             arguments["pickup_hint"],
             arguments["phone"],
+        )
+
+    if tool_name == "test_request_food_from_food_bank":
+        required = ["recipient_phone", "listing_id", "food_bank_phone"]
+        if any(key not in arguments for key in required):
+            return _missing_args(tool_name, arguments, required)
+        return await request_food_from_food_bank(
+            supabase,
+            arguments["recipient_phone"],
+            arguments["listing_id"],
+            arguments["food_bank_phone"],
         )
 
     if tool_name == "test_register_food_bank":
@@ -284,6 +296,12 @@ class ClaimFoodListingRequest(BaseModel):
     phone: str
 
 
+class RequestFoodFromFoodBankRequest(BaseModel):
+    recipient_phone: str
+    listing_id: str
+    food_bank_phone: str
+
+
 class RegisterFoodBankRequest(BaseModel):
     phone: str
     name: str
@@ -355,6 +373,16 @@ async def test_notify_food_banks(payload: NotifyFoodBanksRequest):
 @router.post("/test/claim-food-listing")
 async def test_claim_food_listing(payload: ClaimFoodListingRequest):
     return await claim_food_listing(supabase, payload.food_type, payload.pickup_hint, payload.phone)
+
+
+@router.post("/test/request-food-from-food-bank")
+async def test_request_food_from_food_bank(payload: RequestFoodFromFoodBankRequest):
+    return await request_food_from_food_bank(
+        supabase,
+        payload.recipient_phone,
+        payload.listing_id,
+        payload.food_bank_phone,
+    )
 
 
 @router.post("/test/register-food-bank")

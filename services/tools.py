@@ -914,7 +914,9 @@ async def get_available_food(supabase: Client, zip: str, income_tier: str) -> di
     Fires once recipient is registered or identified.
     Queries listings by zip and status, returns list the assistant reads aloud.
     """
-    allowed_statuses = ["available", "food_bank_window", "open"] if income_tier == "free" else ["available", "open"]
+    zip = str(zip).strip().split("-")[0][:5]
+    # Keep food_bank_window visible for callers that should see food-bank-routed inventory.
+    allowed_statuses = ["available", "food_bank_window", "open"]
     now = datetime.now(timezone.utc).isoformat()
 
     result = (
@@ -1493,23 +1495,316 @@ async def register_food_bank(
 # ============================================================
 
 async def get_nearby_food_banks(supabase: Client, zip: str) -> dict:
+    zip5 = str(zip).strip().split("-")[0][:5]
     result = (
         supabase.table(FOOD_BANKS_TABLE)
-        .select("name, address, zip, phone")
-        .eq("zip", zip)
+        .select("name, address, zip, phone, preferred_lang, status")
+        .eq("zip", zip5)
         .eq("status", "verified")
         .execute()
     )
 
-    food_banks = result.data
+    food_banks = result.data or []
 
     if not food_banks:
-        return {"result": "I couldn't find any food banks near your zip code right now."}
+        return {
+            "result": "I couldn't find any verified food banks near your zip code right now.",
+            "zip": zip5,
+            "nearby_food_banks": [],
+            "claimed_food_options": [],
+        }
+
+    bank_phones = [str(fb.get("phone") or "").strip() for fb in food_banks if fb.get("phone")]
+    claimed_food_options: list[dict[str, object]] = []
+    if bank_phones:
+        claims_resp = (
+            supabase.table(CLAIMS_TABLE)
+            .select("id, listing_id, claimer_phone")
+            .eq("claimer_type", "food_bank")
+            .in_("claimer_phone", bank_phones)
+            .limit(30)
+            .execute()
+        )
+        claim_rows = claims_resp.data or []
+        listing_ids = [
+            str(row.get("listing_id"))
+            for row in claim_rows
+            if row.get("listing_id")
+        ]
+        listing_ids = list(dict.fromkeys(listing_ids))
+
+        listings_by_id: dict[str, dict] = {}
+        if listing_ids:
+            now = datetime.now(timezone.utc).isoformat()
+            listings_resp = (
+                supabase.table(LISTINGS_TABLE)
+                .select("id, food_type, quantity, pickup_addr, pickup_time, expiry_time, zip, status")
+                .in_("id", listing_ids)
+                .eq("zip", zip5)
+                .eq("status", "claimed")
+                .or_(f"expiry_time.gt.{now},expiry_time.is.null")
+                .execute()
+            )
+            listings_by_id = {
+                str(row["id"]): row for row in (listings_resp.data or []) if row.get("id")
+            }
+
+        banks_by_phone = {
+            str(fb.get("phone") or ""): fb for fb in food_banks if fb.get("phone")
+        }
+        for claim_row in claim_rows:
+            listing_id = str(claim_row.get("listing_id") or "")
+            listing = listings_by_id.get(listing_id)
+            if not listing:
+                continue
+            bank_phone = str(claim_row.get("claimer_phone") or "")
+            bank = banks_by_phone.get(bank_phone)
+            if not bank:
+                continue
+            claimed_food_options.append(
+                {
+                    "claim_id": str(claim_row.get("id") or ""),
+                    "listing_id": listing_id,
+                    "food_bank_phone": bank_phone,
+                    "food_bank_name": bank.get("name"),
+                    "food_type": listing.get("food_type"),
+                    "quantity": listing.get("quantity"),
+                    "pickup_addr": listing.get("pickup_addr"),
+                    "pickup_time": listing.get("pickup_time"),
+                }
+            )
+
+    nearby_banks_payload = [
+        {
+            "name": fb.get("name"),
+            "address": fb.get("address"),
+            "zip": fb.get("zip"),
+            "phone": fb.get("phone"),
+            "preferred_lang": fb.get("preferred_lang"),
+        }
+        for fb in food_banks[:5]
+    ]
 
     lines = []
     for fb in food_banks[:3]:
         lines.append(f"{fb['name']} at {fb['address']}")
 
     summary = "Here are the nearest food banks to you: " + "; ".join(lines)
-    summary += ". Would you like me to help you claim food from one of these?"
-    return {"result": summary}
+    if claimed_food_options:
+        option_lines = []
+        for option in claimed_food_options[:3]:
+            pickup_addr = option.get("pickup_addr") or "address not specified"
+            pickup_time = option.get("pickup_time") or "time not specified"
+            option_lines.append(
+                f"{option.get('food_type')}, {option.get('quantity')} from {option.get('food_bank_name')} "
+                f"at {pickup_addr} around {pickup_time}"
+            )
+        summary += (
+            " I can currently connect you to these claimed food options: "
+            + "; ".join(option_lines)
+            + ". Would you like me to notify one of these food banks that you are interested?"
+        )
+    else:
+        summary += ". I don't currently see claimed food options in this zip. Would you like me to keep checking?"
+
+    return {
+        "result": summary,
+        "zip": zip5,
+        "nearby_food_banks": nearby_banks_payload,
+        "claimed_food_options": claimed_food_options[:5],
+    }
+
+
+async def _notify_food_bank_of_recipient_interest(
+    food_bank: dict,
+    listing: dict,
+    recipient_phone: str,
+) -> None:
+    vapi_key = os.getenv("VAPI_API_KEY")
+    assistant_id = os.getenv("VAPI_ASSISTANT_ID")
+    phone_number_id = os.getenv("VAPI_PHONE_NUMBER_ID")
+    food_bank_phone = str(food_bank.get("phone") or "").strip()
+    if not (vapi_key and assistant_id and phone_number_id and food_bank_phone):
+        logger.warning(
+            "recipient notify: skipped food bank call due to missing config/phone "
+            "(has_key=%s has_assistant_id=%s has_phone_number_id=%s has_food_bank_phone=%s)",
+            bool(vapi_key),
+            bool(assistant_id),
+            bool(phone_number_id),
+            bool(food_bank_phone),
+        )
+        return
+
+    lang = str(food_bank.get("preferred_lang") or "en").lower()
+    food_type = listing.get("food_type") or "food"
+    quantity = listing.get("quantity") or "an item"
+    pickup_addr = listing.get("pickup_addr") or "address not specified"
+    pickup_time = listing.get("pickup_time") or "time not specified"
+    if lang == "es":
+        first_message = (
+            "Llamas en nombre de MiComida. "
+            f"Un beneficiario nuevo está interesado en {quantity} de {food_type}. "
+            f"La recogida está en {pickup_addr} a las {pickup_time}. "
+            f"El número del beneficiario es {recipient_phone}. "
+            "Por favor confirma seguimiento con el beneficiario."
+        )
+    else:
+        first_message = (
+            "You are calling on behalf of MiComida. "
+            f"A recipient is interested in {quantity} of {food_type}. "
+            f"Pickup is at {pickup_addr} at {pickup_time}. "
+            f"The recipient phone number is {recipient_phone}. "
+            "Please confirm follow-up with the recipient."
+        )
+
+    logger.info(
+        "recipient notify: attempting food bank call listing_id=%s food_bank_phone=%s recipient_phone=%s",
+        str(listing.get("id")),
+        food_bank_phone,
+        recipient_phone,
+    )
+    vapi = Vapi(token=vapi_key)
+    try:
+        await asyncio.to_thread(
+            lambda: vapi.calls.create(
+                assistant_id=assistant_id,
+                assistant_overrides={
+                    "first_message": first_message,
+                    "variable_values": {
+                        "listing_id": str(listing.get("id")),
+                        "recipient_phone": recipient_phone,
+                    },
+                },
+                phone_number_id=phone_number_id,
+                customer={"number": food_bank_phone},
+            )
+        )
+    except Exception as exc:
+        logger.exception(
+            "recipient notify: food bank call failed listing_id=%s food_bank_phone=%s error=%s",
+            str(listing.get("id")),
+            food_bank_phone,
+            exc,
+        )
+        return
+
+    logger.info(
+        "recipient notify: food bank call queued listing_id=%s food_bank_phone=%s",
+        str(listing.get("id")),
+        food_bank_phone,
+    )
+
+
+async def request_food_from_food_bank(
+    supabase: Client,
+    recipient_phone: str,
+    listing_id: str,
+    food_bank_phone: str,
+) -> dict:
+    recipient_phone_n = normalize_phone(recipient_phone)
+    listing_id = str(listing_id or "").strip()
+    food_bank_phone_n = normalize_phone(food_bank_phone)
+
+    if not listing_id:
+        return {"success": False, "reason": "missing_listing_id"}
+    if not food_bank_phone_n:
+        return {"success": False, "reason": "missing_food_bank_phone"}
+
+    logger.info(
+        "recipient request: start recipient_phone=%s listing_id=%s food_bank_phone=%s",
+        recipient_phone_n,
+        listing_id,
+        food_bank_phone_n,
+    )
+
+    recipient_lookup = (
+        supabase.table(USERS_TABLE)
+        .select("id, phone, zip")
+        .eq("phone", recipient_phone_n)
+        .maybe_single()
+        .execute()
+    )
+    if not recipient_lookup or not recipient_lookup.data:
+        return {
+            "success": False,
+            "reason": "recipient_not_registered",
+            "message": "Recipient must be registered before requesting food from a food bank.",
+        }
+
+    food_bank_lookup = (
+        supabase.table(FOOD_BANKS_TABLE)
+        .select("id, name, phone, preferred_lang, status")
+        .eq("phone", food_bank_phone_n)
+        .maybe_single()
+        .execute()
+    )
+    food_bank_row = food_bank_lookup.data if food_bank_lookup else None
+    if not food_bank_row:
+        return {"success": False, "reason": "food_bank_not_found"}
+    if str(food_bank_row.get("status") or "").lower() != "verified":
+        return {"success": False, "reason": "food_bank_not_verified"}
+
+    listing_lookup = (
+        supabase.table(LISTINGS_TABLE)
+        .select("id, food_type, quantity, pickup_addr, pickup_time, zip, status, expiry_time")
+        .eq("id", listing_id)
+        .maybe_single()
+        .execute()
+    )
+    listing_row = listing_lookup.data if listing_lookup else None
+    if not listing_row:
+        return {"success": False, "reason": "listing_not_found"}
+    if str(listing_row.get("status") or "").lower() != "claimed":
+        return {"success": False, "reason": "listing_not_claimed_by_food_bank"}
+
+    claim_lookup = (
+        supabase.table(CLAIMS_TABLE)
+        .select("id, claimer_phone, claimer_type")
+        .eq("listing_id", listing_id)
+        .eq("claimer_phone", food_bank_phone_n)
+        .eq("claimer_type", "food_bank")
+        .limit(1)
+        .execute()
+    )
+    if not claim_lookup or not claim_lookup.data:
+        return {"success": False, "reason": "food_bank_claim_not_found"}
+
+    request_insert = (
+        supabase.table(CLAIMS_TABLE)
+        .insert(
+            {
+                "listing_id": listing_id,
+                "claimer_phone": recipient_phone_n,
+                "claimer_type": "recipient",
+            }
+        )
+        .execute()
+    )
+    request_row = request_insert.data[0] if request_insert and request_insert.data else None
+
+    asyncio.create_task(
+        _notify_food_bank_of_recipient_interest(
+            food_bank=food_bank_row,
+            listing=listing_row,
+            recipient_phone=recipient_phone_n,
+        )
+    )
+
+    logger.info(
+        "recipient request: queued notify listing_id=%s food_bank_phone=%s recipient_phone=%s",
+        listing_id,
+        food_bank_phone_n,
+        recipient_phone_n,
+    )
+    return {
+        "success": True,
+        "request_id": str(request_row["id"]) if request_row else None,
+        "listing_id": listing_id,
+        "food_bank_phone": food_bank_phone_n,
+        "food_bank_name": food_bank_row.get("name"),
+        "food_type": listing_row.get("food_type"),
+        "quantity": listing_row.get("quantity"),
+        "pickup_addr": listing_row.get("pickup_addr"),
+        "pickup_time": listing_row.get("pickup_time"),
+        "message": "Your request has been sent to the food bank. They will follow up shortly.",
+    }
