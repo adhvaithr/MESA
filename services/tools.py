@@ -898,10 +898,8 @@ async def register_donor(
     if not result.data:
         raise RuntimeError(f"donors insert returned no row: {result}")
 
-    if lang == "es":
-        reply = f"Gracias, {name}. Tu restaurante o tienda ha sido registrado en MiComida. Cuando tengas comida sobrante, simplemente llama y dinos qué tienes."
-    else:
-        reply = f"Thank you, {name}. Your business has been registered with MiComida. Whenever you have surplus food, just call us and tell us what you have."
+
+    reply = f"Thank you, {name}. Your business has been registered with Mesa Services. Whenever you have surplus food, just call us and tell us what you have. Please keep all communications in English."
 
     return {"result": reply}
 
@@ -1053,10 +1051,7 @@ async def notify_food_banks(supabase: Client, listing_id: str, zip: str) -> dict
 
     for bank in food_banks:
         lang = bank.get("preferred_lang", "en")
-        if lang == "es":
-            prompt = f"Estás llamando en nombre de MiComida. Un donante ha listado {food_desc} para recoger en {addr} a las {pickup}. ¿Puede su banco de alimentos reclamar esta donación? Si es así, confirme ahora."
-        else:
-            prompt = f"You are calling on behalf of MiComida. A donor has listed {food_desc} for pickup at {addr} at {pickup}. Can your food bank claim this donation? If yes, please confirm now."
+        prompt = f"You are calling on behalf of Mesa Services. A donor has listed {food_desc} for pickup at {addr} at {pickup}. Can your food bank claim this donation? If yes, please confirm now. Please keep all communications in English."
 
         if not (vapi and assistant_id and phone_number_id):
             logger.warning(
@@ -1208,10 +1203,10 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
     claimer_role = claimer.get("role", "someone")
 
     prompt = (
-        "You are calling on behalf of MiComida with an update for a donor. "
+        "You are calling on behalf of Mesa Services with an update for a donor. "
         f"The listing for {quantity} of {food_type} has been claimed by a {claimer_role}. "
         f"Pickup details are {pickup_addr} at {pickup_time}. "
-        "Thank them for donating and keep the call concise and warm."
+        "Thank them for donating and keep the call concise and warm. Please keep all communications in English."
     )
 
     logger.info(
@@ -1695,21 +1690,12 @@ async def _notify_food_bank_of_recipient_interest(
     quantity = listing.get("quantity") or "an item"
     pickup_addr = listing.get("pickup_addr") or "address not specified"
     pickup_time = listing.get("pickup_time") or "time not specified"
-    if lang == "es":
-        first_message = (
-            "Llamas en nombre de MiComida. "
-            f"Un beneficiario nuevo está interesado en {quantity} de {food_type}. "
-            f"La recogida está en {pickup_addr} a las {pickup_time}. "
-            f"El número del beneficiario es {recipient_phone}. "
-            "Por favor confirma seguimiento con el beneficiario."
-        )
-    else:
-        first_message = (
-            "You are calling on behalf of MiComida. "
+    first_message = (
+            "You are calling on behalf of Mesa Services. "
             f"A recipient is interested in {quantity} of {food_type}. "
             f"Pickup is at {pickup_addr} at {pickup_time}. "
             f"The recipient phone number is {recipient_phone}. "
-            "Please confirm follow-up with the recipient."
+            "Please confirm follow-up with the recipient. Please keep all communications in English."
         )
 
     logger.info(
