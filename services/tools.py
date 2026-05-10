@@ -10,6 +10,7 @@ from typing import Literal, TypedDict
 
 import httpx
 from supabase import Client
+from vapi import Vapi
 
 try:
     from firecrawl import Firecrawl
@@ -1038,35 +1039,43 @@ async def notify_food_banks(supabase: Client, listing_id: str, zip: str) -> dict
     assistant_id = os.getenv("VAPI_ASSISTANT_ID")
     phone_number_id = os.getenv("VAPI_PHONE_NUMBER_ID")
     called = []
+    vapi = Vapi(token=vapi_key) if vapi_key else None
 
-    async with httpx.AsyncClient() as client:
-        for bank in food_banks:
-            lang = bank.get("preferred_lang", "en")
-            if lang == "es":
-                prompt = f"Estás llamando en nombre de MiComida. Un donante ha listado {food_desc} para recoger en {addr} a las {pickup}. ¿Puede su banco de alimentos reclamar esta donación? Si es así, confirme ahora."
-            else:
-                prompt = f"You are calling on behalf of MiComida. A donor has listed {food_desc} for pickup at {addr} at {pickup}. Can your food bank claim this donation? If yes, please confirm now."
+    for bank in food_banks:
+        lang = bank.get("preferred_lang", "en")
+        if lang == "es":
+            prompt = f"Estás llamando en nombre de MiComida. Un donante ha listado {food_desc} para recoger en {addr} a las {pickup}. ¿Puede su banco de alimentos reclamar esta donación? Si es así, confirme ahora."
+        else:
+            prompt = f"You are calling on behalf of MiComida. A donor has listed {food_desc} for pickup at {addr} at {pickup}. Can your food bank claim this donation? If yes, please confirm now."
 
-            await client.post(
-                "https://api.vapi.ai/call/phone",
-                headers={"Authorization": f"Bearer {vapi_key}"},
-                json={
-                    "assistantId": assistant_id,
-                    "assistantOverrides": {
-                        "systemPrompt": prompt,
-                        "variable": {"listing_id": listing_id},
-                    },
-                    "phoneNumberId": phone_number_id,
-                    "customer": {"number": bank["phone"]},
-                },
+        if not (vapi and assistant_id and phone_number_id):
+            logger.warning(
+                "notify_food_banks: skipped Vapi call due to missing config "
+                "(has_key=%s has_assistant_id=%s has_phone_number_id=%s)",
+                bool(vapi_key),
+                bool(assistant_id),
+                bool(phone_number_id),
             )
+            continue
 
-            supabase.table("alert_log").insert({
-                "listing_id": listing_id,
-                "food_bank_phone": bank["phone"],
-            }).execute()
+        await asyncio.to_thread(
+            lambda: vapi.calls.create(
+                assistant_id=assistant_id,
+                assistant_overrides={
+                    "systemPrompt": prompt,
+                    "variableValues": {"listing_id": listing_id},
+                },
+                phone_number_id=phone_number_id,
+                customer={"number": bank["phone"]},
+            )
+        )
 
-            called.append(bank["name"])
+        supabase.table("alert_log").insert({
+            "listing_id": listing_id,
+            "food_bank_phone": bank["phone"],
+        }).execute()
+
+        called.append(bank["name"])
 
     return {"result": f"Notified {len(called)} food bank(s): {', '.join(called)}. They are being called now."}
 
@@ -1182,30 +1191,25 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
         "Thank them for donating and keep the call concise and warm."
     )
 
-    payload = {
-        "assistantId": assistant_id,
-        "assistantOverrides": {
-            "systemPrompt": prompt,
-            "variable": {"listing_id": str(listing.get("id"))},
-        },
-        "phoneNumberId": phone_number_id,
-        "customer": {"number": donor_phone},
-    }
-
     logger.info(
         "claim notify: attempting donor call listing_id=%s donor_phone=%s claimer_role=%s",
         str(listing.get("id")),
         donor_phone,
         claimer_role,
     )
+    vapi = Vapi(token=vapi_key)
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                "https://api.vapi.ai/call/phone",
-                headers={"Authorization": f"Bearer {vapi_key}"},
-                json=payload,
+        await asyncio.to_thread(
+            lambda: vapi.calls.create(
+                assistant_id=assistant_id,
+                assistant_overrides={
+                    "systemPrompt": prompt,
+                    "variableValues": {"listing_id": str(listing.get("id"))},
+                },
+                phone_number_id=phone_number_id,
+                customer={"number": donor_phone},
             )
-            response.raise_for_status()
+        )
     except Exception as exc:
         logger.exception(
             "claim notify: donor call failed listing_id=%s donor_phone=%s error=%s",
@@ -1216,10 +1220,9 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
         return
 
     logger.info(
-        "claim notify: donor call queued listing_id=%s donor_phone=%s status=%s",
+        "claim notify: donor call queued listing_id=%s donor_phone=%s",
         str(listing.get("id")),
         donor_phone,
-        response.status_code,
     )
 
 
