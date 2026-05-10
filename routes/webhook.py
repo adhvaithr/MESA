@@ -346,7 +346,7 @@ async def test_notify_food_banks(payload: NotifyFoodBanksRequest):
 
 @router.post("/test/claim-food-listing")
 async def test_claim_food_listing(payload: ClaimFoodListingRequest):
-    return await claim_food_listing(supabase, payload.listing_id, payload.phone)
+    return await claim_food_listing(supabase, payload.food_type, payload.pickup_hint, payload.phone)
 
 
 @router.post("/test/register-food-bank")
