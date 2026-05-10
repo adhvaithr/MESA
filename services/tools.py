@@ -1127,6 +1127,142 @@ async def _lookup_caller_zip(supabase: Client, phone: str) -> str | None:
     return None
 
 
+async def _lookup_claimer(supabase: Client, phone: str) -> dict[str, str]:
+    """Best-effort claimer role lookup for claim audit trail."""
+    for table, role in (
+        (USERS_TABLE, "recipient"),
+        (FOOD_BANKS_TABLE, "food_bank"),
+        (DONORS_TABLE, "donor"),
+    ):
+        try:
+            r = (
+                supabase.table(table)
+                .select("id")
+                .eq("phone", phone)
+                .limit(1)
+                .execute()
+            )
+            if r and r.data:
+                return {"role": role}
+        except Exception:
+            continue
+    return {"role": "unknown"}
+
+
+async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, str]) -> None:
+    """Fire-and-forget donor notification via Vapi outbound call."""
+    vapi_key = os.getenv("VAPI_API_KEY")
+    assistant_id = os.getenv("VAPI_ASSISTANT_ID")
+    phone_number_id = os.getenv("VAPI_PHONE_NUMBER_ID")
+
+    donor_phone = str(donor.get("phone") or "").strip()
+    if not (vapi_key and assistant_id and phone_number_id and donor_phone):
+        return
+
+    food_type = listing.get("food_type") or "food"
+    quantity = listing.get("quantity") or "an item"
+    pickup_addr = listing.get("pickup_addr") or "the listed pickup location"
+    pickup_time = listing.get("pickup_time") or "the listed pickup time"
+    claimer_role = claimer.get("role", "someone")
+
+    prompt = (
+        "You are calling on behalf of MiComida with an update for a donor. "
+        f"The listing for {quantity} of {food_type} has been claimed by a {claimer_role}. "
+        f"Pickup details are {pickup_addr} at {pickup_time}. "
+        "Thank them for donating and keep the call concise and warm."
+    )
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        await client.post(
+            "https://api.vapi.ai/call/phone",
+            headers={"Authorization": f"Bearer {vapi_key}"},
+            json={
+                "assistantId": assistant_id,
+                "assistantOverrides": {
+                    "systemPrompt": prompt,
+                    "variable": {"listing_id": str(listing.get("id"))},
+                },
+                "phoneNumberId": phone_number_id,
+                "customer": {"number": donor_phone},
+            },
+        )
+
+
+async def claim_food_listing_by_id(
+    supabase: Client,
+    listing_id: str,
+    phone: str,
+) -> dict:
+    """Claims a listing directly by listing_id and notifies donor."""
+    phone = normalize_phone(phone)
+    listing_id = str(listing_id).strip()
+    if not listing_id:
+        return {"success": False, "reason": "missing_listing_id"}
+
+    listing_resp = (
+        supabase.table(LISTINGS_TABLE)
+        .select("id, food_type, quantity, pickup_addr, pickup_time, donor_phone, status")
+        .eq("id", listing_id)
+        .maybe_single()
+        .execute()
+    )
+    listing_row = listing_resp.data if listing_resp else None
+    if not listing_row:
+        return {"success": False, "reason": "listing_not_found"}
+
+    update = (
+        supabase.table(LISTINGS_TABLE)
+        .update({"status": "claimed"})
+        .eq("id", listing_id)
+        .in_("status", ["available", "food_bank_window", "open"])
+        .execute()
+    )
+    if not update.data:
+        return {
+            "success": False,
+            "reason": "already_claimed_or_unavailable",
+            "message": "This listing is no longer available to claim.",
+        }
+
+    listing = update.data[0]
+    claimer = await _lookup_claimer(supabase, phone)
+    claim = (
+        supabase.table(CLAIMS_TABLE)
+        .insert(
+            {
+                "listing_id": listing["id"],
+                "claimer_phone": phone,
+                "claimer_type": claimer["role"],
+            }
+        )
+        .execute()
+    )
+
+    donor = (
+        supabase.table(DONORS_TABLE)
+        .select("phone, name, address")
+        .eq("phone", listing.get("donor_phone"))
+        .maybe_single()
+        .execute()
+    )
+    donor_row = donor.data if donor else None
+    if donor_row:
+        asyncio.create_task(
+            _notify_donor_of_claim(donor=donor_row, listing=listing, claimer=claimer)
+        )
+
+    return {
+        "success": True,
+        "claim_id": str(claim.data[0]["id"]) if claim.data else None,
+        "listing_id": str(listing["id"]),
+        "food_type": listing.get("food_type"),
+        "quantity": listing.get("quantity"),
+        "pickup_addr": listing.get("pickup_addr"),
+        "pickup_time": listing.get("pickup_time"),
+        "donor_phone": donor_row["phone"] if donor_row else None,
+    }
+
+
 async def claim_food_listing(
     supabase: Client,
     food_type: str,

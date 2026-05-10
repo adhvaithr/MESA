@@ -14,6 +14,7 @@ from services.tools import (
     save_food_listing,
     notify_food_banks,
     claim_food_listing,
+    claim_food_listing_by_id,
     register_food_bank,
     verify_organization,
     get_nearby_food_banks,
@@ -95,6 +96,12 @@ async def _dispatch_tool_call(tool_name: str, arguments: dict) -> dict:
         return await notify_food_banks(supabase, arguments["listing_id"], arguments["zip"])
 
     if tool_name == "test_claim_food_listing":
+        if "listing_id" in arguments and "phone" in arguments:
+            return await claim_food_listing_by_id(
+                supabase,
+                arguments["listing_id"],
+                arguments["phone"],
+            )
         required = ["food_type", "pickup_hint", "phone"]
         if any(key not in arguments for key in required):
             return _missing_args(tool_name, arguments, required)
