@@ -914,7 +914,14 @@ async def get_available_food(supabase: Client, zip: str, income_tier: str) -> di
     Fires once recipient is registered or identified.
     Queries listings by zip and status, returns list the assistant reads aloud.
     """
-    zip = str(zip).strip().split("-")[0][:5]
+    raw_zip = str(zip or "").strip()
+    zip = _normalize_zip5(raw_zip)
+    if not zip:
+        return {
+            "result": "I need a valid 5-digit ZIP code to check available food. Could you share it again?",
+            "error": "invalid_zip",
+            "input_zip": raw_zip,
+        }
     # Keep food_bank_window visible for callers that should see food-bank-routed inventory.
     allowed_statuses = ["available", "food_bank_window", "open"]
     now = datetime.now(timezone.utc).isoformat()
@@ -1495,7 +1502,16 @@ async def register_food_bank(
 # ============================================================
 
 async def get_nearby_food_banks(supabase: Client, zip: str) -> dict:
-    zip5 = str(zip).strip().split("-")[0][:5]
+    zip5 = _normalize_zip5(zip)
+    if not zip5:
+        return {
+            "result": "I need a valid 5-digit ZIP code to find nearby food banks.",
+            "zip": str(zip or ""),
+            "nearby_food_banks": [],
+            "claimed_food_options": [],
+            "error": "invalid_zip",
+        }
+
     result = (
         supabase.table(FOOD_BANKS_TABLE)
         .select("name, address, zip, phone, preferred_lang, status")
@@ -1507,8 +1523,33 @@ async def get_nearby_food_banks(supabase: Client, zip: str) -> dict:
     food_banks = result.data or []
 
     if not food_banks:
+        fallback_result = (
+            supabase.table(FOOD_BANKS_TABLE)
+            .select("name, address, zip, phone, preferred_lang, status")
+            .eq("zip", zip5)
+            .limit(5)
+            .execute()
+        )
+        fallback_banks = fallback_result.data or []
+        if fallback_banks:
+            return {
+                "result": "I found food banks in this ZIP, but none are currently verified.",
+                "zip": zip5,
+                "nearby_food_banks": [
+                    {
+                        "name": fb.get("name"),
+                        "address": fb.get("address"),
+                        "zip": fb.get("zip"),
+                        "phone": fb.get("phone"),
+                        "preferred_lang": fb.get("preferred_lang"),
+                        "status": fb.get("status"),
+                    }
+                    for fb in fallback_banks
+                ],
+                "claimed_food_options": [],
+            }
         return {
-            "result": "I couldn't find any verified food banks near your zip code right now.",
+            "result": "I couldn't find any food banks near your zip code right now.",
             "zip": zip5,
             "nearby_food_banks": [],
             "claimed_food_options": [],
