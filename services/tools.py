@@ -1,5 +1,6 @@
 # services/tools.py
 import asyncio
+import logging
 import os
 import re
 import secrets
@@ -81,6 +82,7 @@ class VerificationCheckResult(TypedDict):
 
 CHECK_TIMEOUT_SECONDS = 1.2
 OVERALL_VERIFY_TIMEOUT_SECONDS = 2.5
+logger = logging.getLogger("uvicorn.error")
 
 
 # ============================================================
@@ -1157,6 +1159,14 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
 
     donor_phone = str(donor.get("phone") or "").strip()
     if not (vapi_key and assistant_id and phone_number_id and donor_phone):
+        logger.warning(
+            "claim notify: skipped donor call due to missing config or phone "
+            "(has_key=%s has_assistant_id=%s has_phone_number_id=%s has_donor_phone=%s)",
+            bool(vapi_key),
+            bool(assistant_id),
+            bool(phone_number_id),
+            bool(donor_phone),
+        )
         return
 
     food_type = listing.get("food_type") or "food"
@@ -1172,20 +1182,45 @@ async def _notify_donor_of_claim(donor: dict, listing: dict, claimer: dict[str, 
         "Thank them for donating and keep the call concise and warm."
     )
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        await client.post(
-            "https://api.vapi.ai/call/phone",
-            headers={"Authorization": f"Bearer {vapi_key}"},
-            json={
-                "assistantId": assistant_id,
-                "assistantOverrides": {
-                    "systemPrompt": prompt,
-                    "variable": {"listing_id": str(listing.get("id"))},
-                },
-                "phoneNumberId": phone_number_id,
-                "customer": {"number": donor_phone},
-            },
+    payload = {
+        "assistantId": assistant_id,
+        "assistantOverrides": {
+            "systemPrompt": prompt,
+            "variable": {"listing_id": str(listing.get("id"))},
+        },
+        "phoneNumberId": phone_number_id,
+        "customer": {"number": donor_phone},
+    }
+
+    logger.info(
+        "claim notify: attempting donor call listing_id=%s donor_phone=%s claimer_role=%s",
+        str(listing.get("id")),
+        donor_phone,
+        claimer_role,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.vapi.ai/call/phone",
+                headers={"Authorization": f"Bearer {vapi_key}"},
+                json=payload,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        logger.exception(
+            "claim notify: donor call failed listing_id=%s donor_phone=%s error=%s",
+            str(listing.get("id")),
+            donor_phone,
+            exc,
         )
+        return
+
+    logger.info(
+        "claim notify: donor call queued listing_id=%s donor_phone=%s status=%s",
+        str(listing.get("id")),
+        donor_phone,
+        response.status_code,
+    )
 
 
 async def claim_food_listing_by_id(
