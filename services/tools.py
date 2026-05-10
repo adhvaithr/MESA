@@ -306,7 +306,7 @@ async def get_available_food(supabase: Client, zip: str, income_tier: str) -> di
         .eq("zip", zip)
         .in_("status", allowed_statuses)
         .or_(f"expiry_time.gt.{now},expiry_time.is.null")
-        .order("expiry_time", ascending=True)
+        .order("expiry_time", desc=False)
         .limit(3)
         .execute()
     )
