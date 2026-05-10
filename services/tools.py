@@ -68,7 +68,9 @@ class IdentifyCallerResult(TypedDict, total=False):
     user_id: str | None
     donor_id: str | None
     food_bank_id: str | None
-    income_tier: str | None
+    user: dict[str, object]
+    donor: dict[str, object]
+    food_bank: dict[str, object]
 
 
 class VerificationCheckResult(TypedDict):
@@ -743,7 +745,7 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
 
     u = (
         supabase.table(USERS_TABLE)
-        .select("id, onboarded, income_tier")
+        .select("*")
         .eq("phone", normalized)
         .maybe_single()
         .execute()
@@ -754,15 +756,12 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         return {
             "role": "recipient",
             "registration_status": reg,
-            "user_id": str(row["id"]),
-            "donor_id": None,
-            "food_bank_id": None,
-            "income_tier": row.get("income_tier"),
+            "user": row,
         }
 
     d = (
         supabase.table(DONORS_TABLE)
-        .select("id")
+        .select("*")
         .eq("phone", normalized)
         .maybe_single()
         .execute()
@@ -771,15 +770,12 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         return {
             "role": "donor",
             "registration_status": "registered",
-            "user_id": None,
-            "donor_id": str(d.data["id"]),
-            "food_bank_id": None,
-            "income_tier": None,
+            "donor": d.data,
         }
 
     f = (
         supabase.table(FOOD_BANKS_TABLE)
-        .select("id, status")
+        .select("*")
         .eq("phone", normalized)
         .maybe_single()
         .execute()
@@ -791,10 +787,7 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         return {
             "role": "food_bank",
             "registration_status": reg,
-            "user_id": None,
-            "donor_id": None,
-            "food_bank_id": str(row["id"]),
-            "income_tier": None,
+            "food_bank": row,
         }
 
     return {
@@ -803,7 +796,6 @@ async def identify_caller(supabase: Client, phone: str) -> IdentifyCallerResult:
         "user_id": None,
         "donor_id": None,
         "food_bank_id": None,
-        "income_tier": None,
     }
 
 
@@ -919,7 +911,7 @@ async def get_available_food(supabase: Client, zip: str, income_tier: str) -> di
     Fires once recipient is registered or identified.
     Queries listings by zip and status, returns list the assistant reads aloud.
     """
-    allowed_statuses = ["food_bank_window", "open"] if income_tier == "free" else ["open"]
+    allowed_statuses = ["available", "food_bank_window", "open"] if income_tier == "free" else ["available", "open"]
     now = datetime.now(timezone.utc).isoformat()
 
     result = (
