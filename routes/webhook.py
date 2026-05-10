@@ -2,10 +2,18 @@
 import json
 import logging
 import os
+import time
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from supabase import create_client
+from services.call_logger import (
+    compute_t,
+    log_call_start,
+    log_call_end,
+    log_turn_event,
+    log_tool_event,
+)
 from services.tools import (
     identify_caller,
     register_new_user,
@@ -176,10 +184,32 @@ async def vapi_webhook(request: Request):
     logger.info("VAPI webhook: incoming payload=%s", json.dumps(body, default=str))
 
     message = body.get("message", {})
-    if not isinstance(message, dict) or message.get("type") != "tool-calls":
+    if not isinstance(message, dict):
+        return {"results": []}
+
+    msg_type = message.get("type")
+    vapi_call_id = message.get("call", {}).get("id", "unknown")
+
+    if msg_type == "hang":
+        await log_call_start(supabase, message)
+        return {"results": []}
+
+    if msg_type == "transcript":
+        t = compute_t(message)
+        role = message.get("role", "user")
+        speaker = "agent" if role == "assistant" else "caller"
+        text = message.get("transcript", "")
+        await log_turn_event(supabase, vapi_call_id, t, speaker, text)
+        return {"results": []}
+
+    if msg_type == "end-of-call-report":
+        await log_call_end(supabase, message)
+        return {"results": []}
+
+    if msg_type != "tool-calls":
         logger.warning(
-            "VAPI webhook: ignored message type. message=%s",
-            json.dumps(message, default=str),
+            "VAPI webhook: ignored message type=%s",
+            msg_type,
         )
         return {"results": []}
 
@@ -219,6 +249,7 @@ async def vapi_webhook(request: Request):
             json.dumps(arguments, default=str),
         )
 
+        start_ts = time.perf_counter()
         try:
             result = await _dispatch_tool_call(tool_name, arguments)
         except Exception as exc:
@@ -241,6 +272,10 @@ async def vapi_webhook(request: Request):
                 tool_name,
                 json.dumps(result, default=str),
             )
+
+        dur_ms = int((time.perf_counter() - start_ts) * 1000)
+        t = compute_t(message)
+        await log_tool_event(supabase, vapi_call_id, t, tool_name, arguments, result, dur_ms)
 
         results.append(
             {

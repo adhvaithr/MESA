@@ -948,7 +948,7 @@ async def get_available_food(supabase: Client, zip: str, income_tier: str) -> di
 
     summary = "Here's what's available near you: " + "; ".join(lines)
     summary += ". Would you like to claim any of these?"
-    return {"result": summary}
+    return {"result": summary, "listings_raw": listings}
 
 
 # ============================================================
