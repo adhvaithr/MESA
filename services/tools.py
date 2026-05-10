@@ -836,6 +836,7 @@ async def register_new_user(
             "household_size": household_size,
             "income_tier": income_tier,
             "lang": lang,
+            "onboarded": True,
         }, on_conflict="phone")
         .execute()
     )
