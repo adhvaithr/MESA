@@ -1,8 +1,9 @@
 import { CallMonitor } from '@/components/CallMonitor';
 import { SAMPLE_META, SAMPLE_TIMELINE } from '@/lib/staticData';
 import type { CallMeta, TimelineEvent } from '@/lib/types';
+import { getBackendBaseUrl } from '@/lib/backend';
 
-const BACKEND = (process.env.BACKEND_URL ?? 'http://localhost:8000').replace(/\/+$/, '');
+const BACKEND = getBackendBaseUrl();
 
 async function fetchCallData(callId?: string): Promise<{ meta: CallMeta; timeline: TimelineEvent[] } | null> {
   try {
